@@ -1,0 +1,412 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<xwikidoc>
+  <web>Admin</web>
+  <name>Rights enforcer</name>
+  <language/>
+  <defaultLanguage/>
+  <translation>0</translation>
+  <parent>Admin.WebHome</parent>
+  <creator>xwiki:XWiki.Admin</creator>
+  <author>xwiki:XWiki.Admin</author>
+  <customClass/>
+  <contentAuthor>xwiki:XWiki.Admin</contentAuthor>
+  <creationDate>1428576588000</creationDate>
+  <date>1429191956000</date>
+  <contentUpdateDate>1429191956000</contentUpdateDate>
+  <version>1.1</version>
+  <title>Rights enforcer</title>
+  <defaultTemplate/>
+  <validationScript/>
+  <comment/>
+  <minorEdit>false</minorEdit>
+  <syntaxId>xwiki/2.1</syntaxId>
+  <hidden>false</hidden>
+  <content>{{groovy}}
+
+/*
+ * Display form
+ */
+
+println """
+{{html clean="false"}}
+    <form action="" method="post">
+      <textarea name="schema" rows="20" style="width:100%">${request.schema ? request.schema : ""}</textarea>
+      <input class="btn btn-info" type="submit" name="preview" value="Preview"/>
+      <input class="btn btn-success" type="submit" name="perform" value="Perform" onclick="return confirm('Are you sure you want to apply this schema?');"/>
+    </form>
+{{/html}}
+"""
+
+
+/*
+ * Take action
+ */
+
+def rawSchema;
+def processedSchema;
+def errors;
+
+if (request.preview || request.perform) {
+  def jsonSlurper = new groovy.json.JsonSlurper();
+
+  try {
+    rawSchema  = jsonSlurper.parseText(request.schema);
+  } catch (Exception ex) {
+    println """{{error}}${ex.message}{{/error}}""";
+  }
+
+  if (!rawSchema) {
+    return;
+  }
+
+  processedSchema = ["purge":[:], "rights":[:]];
+
+  def purge  = rawSchema.purge;
+  def rights = rawSchema.rights;
+
+  def currentWiki = xcontext.getDatabase();
+
+  /*
+   * Purge
+   */
+
+  def purgeList = processedSchema.purge;
+
+  java.lang.String.metaClass.addQuotes = { "'" + delegate + "'" }
+  java.util.ArrayList.metaClass.addToPurgeList = { wiki, source, reference -&gt;
+    purgeList.get(wiki).documents.putAll(delegate.collectEntries {
+      [(it) : ["exists" : xwiki.exists(it), "source" : source, "reference" : reference]]
+    })
+  }
+
+  if (purge) {
+    for (purgeEntry in purge) {
+      def wikis = purgeEntry.wikis;
+
+      if (!wikis) {
+        wikis = [currentWiki];
+      }
+
+      for (wiki in wikis) {
+        // Check if the wiki exists
+        def wikiExists = services.wiki.exists(wiki);
+
+        // Set the database
+        xcontext.setDatabase(wikiExists ? wiki : currentWiki);
+
+        // Add new entry for wiki
+        if (!purgeList.get(wiki)) {
+          purgeList.put(wiki, ["exists" : wikiExists, "documents" : [:]]);
+        }
+
+        // Add specified documents
+        if (purgeEntry.documents) {
+          def documents = purgeEntry.documents;
+          documents.addToPurgeList(wiki, "purge", [:]);
+        }
+
+        // Add all documents contained within the specified spaces
+        if (wikiExists &amp;&amp; purgeEntry.spaces) {
+          for (space in purgeEntry.spaces) {
+            def spaces = purgeEntry.spaces*.addQuotes().join(",");
+            def documents = services.query.hql("where doc.space in (${spaces})").setWiki(wiki).execute();
+            documents.addToPurgeList(wiki, "purge", [:]);
+          }
+        }
+
+        // Add all documents which contain objects of one of the specified classes
+        if (wikiExists &amp;&amp; purgeEntry.classes) {
+          def classes = purgeEntry.classes*.addQuotes().join(",");
+          def documents = services.query.hql(", BaseObject as obj where doc.fullName = obj.name and obj.className in (${classes})").setWiki(wiki).execute();
+          documents.addToPurgeList(wiki, "purge", [:]);
+        }
+
+        // Exclude documents
+        if (purgeEntry.excludes) {
+          for (exclude in purgeEntry.excludes) {
+            if (exclude.size() &gt; 2 &amp;&amp; (exclude.startsWith("*.") || exclude.endsWith(".*"))) {
+              for (doc in purgeList.get(wiki).collect()) {
+                if (
+                 (exclude.startsWith("*.") &amp;&amp; doc.key.endsWith(exclude.substring(2))) ||
+                 (exclude.endsWith(".*") &amp;&amp; doc.key.startsWith(exclude.substring(0, exclude.lastIndexOf(".*"))))
+                ) {              purgeList.get(wiki).documents.remove(doc.key);
+                }
+              }
+            } else {
+              purgeList.get(wiki).documents.remove(exclude);
+            }
+          }
+        }
+
+      }
+    }
+  }
+
+  /*
+   * Rights
+   */
+
+  if (rights) {
+    for (rawRightsEntry in rights) {
+      def wikiId = rawRightsEntry.wikis.join(",");
+
+      if (!processedSchema.rights.get(wikiId)) {
+        processedSchema.rights.put(wikiId, []);
+      }
+
+      for (rawSchemaEntry in rawRightsEntry.schema) {
+        def processedSchemaEntry = [:];
+
+        // Add entities
+        processedSchemaEntry.put("entities", rawSchemaEntry.entities.join(",").replace("[","").replace("]",""));
+
+        // Add properties
+        if (rawSchemaEntry.properties) {
+          processedSchemaEntry.put("properties", rawSchemaEntry.properties);
+        }
+
+        // Extract document list from entities
+        processedSchemaEntry.put("documents", []);
+
+        for (wiki in rawRightsEntry.wikis) {
+          def wikiExists = services.wiki.exists(wiki);
+
+          for (entity in rawSchemaEntry.entities) {
+            if (entity == "global") {
+              processedSchemaEntry.documents.add("XWiki.XWikiPreferences");
+            } else if (entity.indexOf(".") == -1) {
+              processedSchemaEntry.documents.add("${entity}.WebPreferences");
+            } else if (wikiExists &amp;&amp; entity.size() &gt; 2 &amp;&amp; entity.endsWith(".*")) {
+              def documents = services.query.hql("""where doc.space = '${entity.substring(0, entity.lastIndexOf(".*"))}'""").setWiki(wiki).execute();
+              processedSchemaEntry.documents.addAll(documents);
+            } else if (wikiExists &amp;&amp; entity.size() &gt; 2 &amp;&amp; entity.startsWith("*.")) {
+              def documents = services.query.hql("where doc.name = '${entity.substring(2)}'").setWiki(wiki).execute();
+              processedSchemaEntry.documents.addAll(documents);
+            } else if (!entity.endsWith(".*") &amp;&amp; !entity.startsWith("*.")){
+              processedSchemaEntry.documents.add(entity);
+            }
+          }
+
+          // Get document purge list for wiki
+          if (!processedSchema.purge.get(wiki)) {
+            processedSchema.purge.put(wiki, ["exists" : wikiExists, "documents":[:]]);
+          }
+
+          // Schedule documents to be purged
+          processedSchemaEntry.documents.unique().addToPurgeList(wiki, "schema", ["entity" : rawSchemaEntry.entities.join(",")]);
+
+          // Update the wiki reference for all the documents contained in the current wiki
+          // Even those which are not part of the schema
+          for (doc in processedSchema.purge.get(wiki).documents) {
+            doc.value.reference.put("wiki", rawRightsEntry.wikis.join(","));
+          }
+        }
+
+        // Add permisions
+        processedSchemaEntry.put("permissions", rawSchemaEntry.permissions);
+
+        // Add the processed entry
+        processedSchema.rights.get(wikiId).add(processedSchemaEntry);
+      }
+    }
+  }
+
+
+  /*
+   * Debug
+   */
+
+  if(request.debug) {
+    println """{{warning}}${new groovy.json.JsonBuilder(processedSchema).toPrettyString()}{{/warning}}""";
+  }
+
+
+  /*
+   * Display
+   */
+
+  // Purge
+  println "= Purge =";
+  println "|=Wiki|=Document|=Actions|=Source|=Status";
+
+  for (wiki in purgeList) {
+    def wikiExists = wiki.value.exists;
+    for (e in wiki.value.documents) {
+      def entry = "";
+
+      def doc  = e.key;
+      def docInfo = e.value;
+
+      // Set database
+      xcontext.setDatabase(wikiExists ? wiki.key : currentWiki);
+
+      // Generate heading id
+      java.lang.String.metaClass.encodeHeading = {
+        def idGenerator = new org.xwiki.rendering.util.IdGenerator();
+        return idGenerator.generateUniqueId("H", delegate);
+      }
+
+      if (docInfo.reference.wiki) {
+        entry += """|[[${wiki.key}&gt;&gt;||anchor="${docInfo.reference.wiki.encodeHeading()}"]]""";
+      } else {
+        entry += "|${wiki.key}";
+      }
+
+      if (docInfo.reference.entity) {
+        entry += """|[[${doc}&gt;&gt;||anchor="${docInfo.reference.entity.encodeHeading()}"]]""";
+      } else {
+        entry += "|${doc}";
+      }
+
+      def space;
+      def page;
+
+      java.lang.String.metaClass.resolve = {
+        def resolver = com.xpn.xwiki.web.Utils.getComponent(org.xwiki.model.reference.DocumentReferenceResolver.TYPE_STRING, "currentmixed");
+        def reference = resolver.resolve(delegate);
+
+        space = reference.getLastSpaceReference().getName()
+        page  = reference.getName();
+      }
+
+      doc.resolve();
+
+      java.lang.String.metaClass.getExternalURL = { action, queryString -&gt;
+        def url = xcontext.context.getURLFactory().createExternalURL(space, page, action, queryString, null, xcontext.database, xcontext.context);
+        return url.toString();
+      }
+
+      if (wikiExists &amp;&amp; docInfo.exists) {
+        entry += """|[[image:icon:page_white&gt;&gt;${doc.getExternalURL("view", "")}||title="view" rel="__blank"]]   """;
+        entry += """[[image:icon:page_white_code&gt;&gt;${doc.getExternalURL("edit", "editor=wiki")}||title="edit in wiki mode" rel="__blank"]]   """;
+        entry += """[[image:icon:page_white_gear&gt;&gt;${doc.getExternalURL("edit", "editor=object")}||title="edit objects" rel="__blank"]]   """;
+        entry += """[[image:icon:page_white_key&gt;&gt;${doc.getExternalURL("edit", "editor=rights")}||title="edit rights" rel="__blank"]]""";
+      } else {
+        entry += "|";
+      }
+      entry += """|${docInfo.source}""";
+      entry += """|${wikiExists ? (docInfo.exists ? "ready to purge" : "document does not exist") : ("wiki does not exist")}""";
+
+      println entry;
+    }
+  }
+
+  // Rights
+  println "= Rights =";
+
+  for (processedRightsEntry in processedSchema.rights) {
+    def wikis   = processedRightsEntry.key;
+    def schemas = processedRightsEntry.value;
+
+    println "== ${wikis} ==";
+
+    for (schema in schemas) {
+      println """==== ${schema.entities} ====""";
+
+      def entities   = ["users" : [:], "groups" : [:], "properties" : [:]];
+
+      groovy.json.internal.LazyMap.metaClass.collectPermissions = {
+        def oldRights = ["view", "comment", "edit", "delete", "admin", "register", "program"].collectEntries{[it, ""]};
+        for (permission in ["allow", "deny"]) {
+          if (delegate.get(permission)) {
+            for (entityType in ["users", "groups"]) {
+              if (delegate.get(permission).get(entityType)) {
+                for (entity in delegate.get(permission).get(entityType)) {
+                  if (entities.get(entityType).get(entity)) {
+                    oldRights = entities.get(entityType).get(entity).clone();
+                  }
+                  oldRights.putAll(delegate.rights.collectEntries{[it, permission]});
+                  entities.get(entityType).put(entity, oldRights);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Collect properties
+      if (schema.properties) {
+        entities.properties = schema.properties;
+      }
+
+      // Collect permissions
+      for (permission in schema.permissions) {
+        permission.collectPermissions()
+      }
+
+      java.lang.String.metaClass.getTickImg = {
+        def img;
+
+        switch (delegate) {
+          case "true":  img = "allow"; break;
+          case "allow": img = "allow"; break;
+          case "deny" : img = "deny1"; break;
+          default:      img = "none";
+        }
+
+        return """{{html}}
+    <img src="/xwiki/resources/js/xwiki/usersandgroups/img/${img}.png"/>{{/html}}""";
+      }
+
+      java.util.LinkedHashMap.metaClass.displayRightsTable = { type -&gt;
+        if (delegate != [:]) {
+          def columns = ["View","Comment","Edit","Delete","Admin","Register","Program"];
+
+          println """(% style="text-align: center;" %)"""
+          print """|=(% style="width: 25%;" %)${type.capitalize()}"""
+
+          for (column in columns)
+            print """|=(% style="text-align: center;" %)${column}""";
+
+          if (request.perform) {
+            print """|=(% style="text-align: center;" %)Status""";
+          }
+
+          println ""
+
+          for (entry in delegate) {
+            def row = """|(% style="text-align: left;" %)${entry.key}""";
+
+            for (right in entry.value)
+              row += """|${right.value.getTickImg()}""";
+            if (request.perform)
+              row += "|success";
+
+            println row;
+          }
+
+          println "\n";
+        }
+      }
+
+      groovy.json.internal.LazyMap.metaClass.displayProperties = {
+        def prettyNames = [
+          "authenticate_view" : "Prevent unregistered users from viewing pages, regardless of the page or space rights",
+          "authenticate_edit" : "Prevent unregistered users from editing pages, regardless of the page or space rights",
+          "comment_captcha"   : "Require unregistered users to solve a captcha when posting a comment on a page"];
+
+        for (prop in prettyNames) {
+          println "|${delegate.get(prop.key).toString().getTickImg()}|${prop.value}";
+        }
+      }
+
+      java.util.LinkedHashMap.metaClass.displayRights = {
+        // Display rights tables
+        for (entityType in ["users", "groups"]) {
+          delegate.get(entityType).displayRightsTable(entityType);
+        }
+
+        // Display properties
+        delegate.get("properties").displayProperties();
+      }
+
+      // Display rights
+      entities.displayRights();
+    }
+  }
+}
+
+{{/groovy}}
+  </content>
+</xwikidoc>
